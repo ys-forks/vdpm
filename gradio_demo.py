@@ -1,9 +1,3 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-# All rights reserved.
-#
-# This source code is licensed under the license found in the
-# LICENSE file in the root directory of this source tree.
-
 import gc
 import glob
 import os
@@ -686,8 +680,8 @@ with gr.Blocks(theme=theme, css=css) as demo:
         """
         <h1>V-DPM: Video Reconstruction with Dynamic Point Maps</h1>
         <p>
-        <a href="https://github.com/facebookresearch/vggt">🐙 GitHub Repository</a> |
-        <a href="#">Project Page</a>
+        <a href="https://github.com/eldar/vdpm">🐙 GitHub Repository</a> |
+        <a href="https://www.robots.ox.ac.uk/~vgg/research/vdpm/">Project Page</a>
         </p>
         <div style="font-size: 16px; line-height: 1.5;">
         <p>Upload a video or a set of images to create a dynamic point map reconstruction of a scene or object.</p>
