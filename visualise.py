@@ -1,7 +1,5 @@
-import os
 import time
 import argparse
-from typing import List
 
 import cv2
 import numpy as np
@@ -15,84 +13,11 @@ from PIL import Image
 from torchvision import transforms as TF
 from einops import repeat
 import matplotlib
+import torch.nn.functional as F
 
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 
 from dpm.model import VDPM
-from util.transforms import transform_points
-
-
-VIDEO_SAMPLE_HZ = 1.0
-
-
-def assign_colours(pts3d, colour=[0, 0, 1]):
-    num_points = pts3d.shape[0]
-    colors = (np.tile(np.array([colour]), (num_points, 1)) * 255).astype(np.uint8)
-    return colors
-
-
-def compute_box_edges(corners):
-    """
-    Compute all edges of a 3D bounding box
-
-    Args:
-        corners: torch tensor of shape (8, 3) containing the coordinates of the 8 corners
-                 of a 3D bounding box
-
-    Returns:
-        edges: torch tensor of shape (12, 2, 3) containing the 12 edges of the box,
-               each represented as a pair of 3D coordinates [start_point, end_point]
-    """
-    # Define the 12 edges of a cube by specifying pairs of corner indices
-    edge_indices = torch.tensor(
-        [
-            # Edges along x-axis
-            [0, 1],
-            [2, 3],
-            [4, 5],
-            [6, 7],
-            # Edges along y-axis
-            [0, 2],
-            [1, 3],
-            [4, 6],
-            [5, 7],
-            # Edges along z-axis
-            [0, 4],
-            [1, 5],
-            [2, 6],
-            [3, 7],
-        ],
-        dtype=torch.long,
-    )
-
-    # Initialize edges tensor
-    edges = torch.zeros((12, 2, 3), dtype=corners.dtype, device=corners.device)
-
-    # Extract the start and end points for each edge
-    for i, (start_idx, end_idx) in enumerate(edge_indices):
-        edges[i, 0] = corners[start_idx]  # Start point
-        edges[i, 1] = corners[end_idx]  # End point
-
-    colors = torch.tensor(
-        [
-            [255, 0, 0],  # Red
-            [0, 255, 0],  # Green
-            [0, 0, 255],  # Blue
-            [255, 255, 0],  # Yellow
-            [0, 255, 255],  # Cyan
-            [255, 0, 255],  # Magenta
-            [255, 128, 0],  # Orange
-            [128, 0, 255],  # Purple
-            [128, 255, 0],  # Lime
-            [255, 0, 128],  # Pink
-            [0, 128, 255],  # Teal
-            [128, 0, 0],  # Maroon
-        ],
-        dtype=torch.uint8,
-        device=corners.device,
-    )
-
-    return edges, colors
 
 
 def remove_static_tracks(
@@ -133,14 +58,14 @@ def compute_predictions(model, images):
     return pointmaps, extrinsic_WC, intrinsic
 
 
-def extract_frames(input_video):
+def extract_frames(input_video, hz=1.0):
     torch.cuda.empty_cache()
 
     video_path = input_video
     vs = cv2.VideoCapture(video_path)
 
     fps = float(vs.get(cv2.CAP_PROP_FPS) or 0.0)
-    frame_interval = max(int(fps / max(VIDEO_SAMPLE_HZ, 1e-6)), 1)
+    frame_interval = max(int(fps / max(hz, 1e-6)), 1)
 
     count = 0
     frame_num = 0
@@ -295,20 +220,61 @@ def load_model(cfg, device) -> VDPM:
     return model
 
 
-def log_predictions(images, pointmaps, poses, intrinsic, threshold=0.9):
+def log_predictions(
+    images, pointmaps, poses, intrinsic, use_global_pts=False, threshold=0.1
+):
     rr.log("world", rr.ViewCoordinates.RIGHT_HAND_Y_DOWN, static=True)
     S = len(pointmaps)
-    pts3d_all = [pr["pts3d"] for pr in pointmaps]
-    conf_all = [pr["conf"] for pr in pointmaps]
+    C = pointmaps[0]["pts3d"].shape[-1]
+    pts3d_all = []
+    conf_all = []
+    scale_factor = 0.25 if use_global_pts else 1.0
+    for i in range(S):
+        pts = pointmaps[i]["pts3d"][0].permute(0, 3, 1, 2)
+        conf = pointmaps[i]["conf"][0].unsqueeze(1)
+        if scale_factor != 1.0:
+            pts = F.interpolate(pts, scale_factor=scale_factor, mode="nearest")
+            conf = F.interpolate(conf, scale_factor=scale_factor, mode="nearest")
+        pts3d_all.append(pts.permute(0, 2, 3, 1))
+        conf_all.append(conf.squeeze(1))
 
-    # all view points in view v0
-    pts3d_v0 = torch.stack([pts3d_all[s][:, 0] for s in range(S)], dim=1)[0].detach()
-    conf_v0 = torch.stack([conf_all[s][:, 0] for s in range(S)], dim=1)[0].detach()
-    # confident points based on view v0
-    conf = conf_v0[0].view(-1).cpu().numpy()
-    thresh = conf[conf.argsort()][int(conf.size * (1 - threshold))]
-    mask = conf_v0[0].cpu().numpy() >= thresh
-    tracks_xyz = remove_static_tracks(pts3d_v0[:, mask].cpu()).numpy()
+    if scale_factor != 1.0:
+        pts_colors = F.interpolate(images, scale_factor=scale_factor, mode="nearest")
+    else:
+        pts_colors = images
+
+    # t0 as reference
+    conf = conf_all[0].detach().cpu()
+    thresh = torch.quantile(conf.view(-1), threshold).item()
+    mask = conf >= thresh
+    if use_global_pts:
+        mask = mask.view(-1)
+        pts3d = torch.stack(
+            [pts3d_all[s].view(-1, C) for s in range(S)], dim=0
+        ).detach()
+        colors = (
+            pts_colors.permute(0, 2, 3, 1)
+            .cpu()
+            .contiguous()
+            .view(-1, images.shape[1])
+            .numpy()
+            * 255
+        ).astype(np.uint8)
+    else:
+        mask = mask[0].view(-1)
+        pts3d = torch.stack(
+            [pts3d_all[s][0].view(-1, C) for s in range(S)], dim=0
+        ).detach()
+        colors = (
+            pts_colors.permute(0, 2, 3, 1)[0]
+            .cpu()
+            .contiguous()
+            .view(-1, images.shape[1])
+            .numpy()
+            * 255
+        ).astype(np.uint8)
+
+    tracks_xyz = remove_static_tracks(pts3d[:, mask].cpu()).numpy()
     num_tracks = min(500, tracks_xyz.shape[1])
     indices = np.random.choice(tracks_xyz.shape[1], num_tracks, replace=False)
     tracks_xyz = tracks_xyz[:, indices]
@@ -326,9 +292,7 @@ def log_predictions(images, pointmaps, poses, intrinsic, threshold=0.9):
     for i in range(S):
         rr.set_time("time", duration=i)
 
-        points = pts3d_v0[i].cpu().numpy()
-        colors = (images[i].permute(1, 2, 0).cpu().numpy() * 255).astype(np.uint8)
-
+        points = pts3d[i].cpu().numpy()
         rr.log(
             "world/points",
             rr.Points3D(
@@ -339,10 +303,11 @@ def log_predictions(images, pointmaps, poses, intrinsic, threshold=0.9):
 
         pose = poses[i].cpu().numpy()
         if i > 0:
+            min_start = max(0, i - 8)
             rr.log(
                 f"world/tracks",
                 rr.LineStrips3D(
-                    tracks_xyz[:, : i + 1],
+                    tracks_xyz[:, min_start : i + 1],
                     colors=track_colors,
                     radii=rr.Radius.ui_points(0.5),
                 ),
@@ -379,12 +344,12 @@ def main(args):
         True  # for gpu >= Ampere and pytorch >= 1.12
     )
 
-    model = load_model(cfg, device)
-
     input_video = args.input_video
-    frames = extract_frames(input_video)
-    images = preprocess_images(frames).to(device)  # (N, 3, H, W)
+    frames = extract_frames(input_video, hz=args.hz)
+    images = preprocess_images(frames, mode="pad").to(device)  # (N, 3, H, W)
+    print(f"Preprocessed frames shape: {images.shape}.")
 
+    model = load_model(cfg, device)
     pointmaps, poses, intrinsic = compute_predictions(model, images)
 
     # rerun visualisation
@@ -401,7 +366,14 @@ def main(args):
     )
     rr.script_setup(args, "rerun_vdpm", default_blueprint=blueprint)
 
-    log_predictions(images, pointmaps, poses, intrinsic)
+    log_predictions(
+        images,
+        pointmaps,
+        poses,
+        intrinsic,
+        use_global_pts=args.use_global_pts,
+        threshold=args.threshold,
+    )
 
 
 if __name__ == "__main__":
@@ -411,6 +383,18 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--config", type=str, default="configs/config.yaml", help="Path to config file"
+    )
+    parser.add_argument(
+        "--hz", type=float, default=3.0, help="Video sampling frequency"
+    )
+    parser.add_argument(
+        "--threshold", type=float, default=0.1, help="Confidence threshold"
+    )
+    parser.add_argument(
+        "--use_global_pts",
+        default=False,
+        action="store_true",
+        help="Visualize all points cross all images through timesteps",
     )
     rr.script_add_args(parser)
     args = parser.parse_args()
