@@ -1,7 +1,7 @@
-defaults:
-  - _self_
-  - hydra: defaults
-  - model: dpm
+model:
+  name: dpm-video
+  pretrained: /work/eldar/models/vggt/VGGT-1B.pt
+  decoder_depth: 4
 
 config:
   exp_name: "debug"
@@ -47,4 +47,3 @@ run:
   local_rank: -1
   dist_url: "env://"
   seed: 0
-
